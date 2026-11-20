@@ -84,7 +84,7 @@ const _: () = assert!(
 /// fingerprinting the voter's exact balance.
 fn denomination_split(
     num_ballots: u64,
-    sk: &SpendingKey,
+    prf_key: &VotePrfKey,
     round_id: pallas::Base,
     proposal_id: u64,
     van_commitment: pallas::Base,
@@ -112,7 +112,7 @@ fn denomination_split(
         distribute_remainder(
             &mut shares[idx..],
             remaining,
-            sk,
+            prf_key,
             round_id,
             proposal_id,
             van_commitment,
@@ -131,7 +131,7 @@ fn denomination_split(
 fn distribute_remainder(
     slots: &mut [u64],
     remainder: u64,
-    sk: &SpendingKey,
+    prf_key: &VotePrfKey,
     round_id: pallas::Base,
     proposal_id: u64,
     van_commitment: pallas::Base,
@@ -166,7 +166,7 @@ fn distribute_remainder(
     let mut total_weight: u64 = 0;
     for i in 0..slots.len() {
         let hash = vote_share_prf(
-            sk,
+            prf_key,
             domain_tags::VOTE_PRF_DOMAIN_REMAINDER,
             round_id,
             proposal_id,
@@ -384,8 +384,40 @@ fn encrypted_share_coordinates(
 ///
 /// This replicates the sign-correction logic from `SpendAuthorizingKey::from`:
 /// `ask = PRF_expand(sk)`, then negate if the resulting ak has ỹ = 1.
+#[cfg(test)]
 fn extract_vsk(sk: &SpendingKey) -> pallas::Scalar {
     voting_crypto_deps::spend_authorizing_scalar(sk)
+}
+
+/// Secret that keys the deterministic per-vote PRF: El Gamal randomness,
+/// share blinds, the share split and its shuffle.
+///
+/// For a software hotkey it is the hotkey's `SpendingKey` bytes
+/// ([`VotePrfKey::from_spending_key`]), which keeps every derivation identical
+/// to earlier releases. A key held as threshold shares has no spending key, so
+/// its holders supply a secret they share instead ([`VotePrfKey::from_bytes`]).
+///
+/// Keep it as secret as a spending key's privacy: anyone holding it can
+/// recompute the El Gamal randomness and so read the vote's share amounts.
+#[derive(Clone)]
+pub struct VotePrfKey([u8; 32]);
+
+impl core::fmt::Debug for VotePrfKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("VotePrfKey(..)")
+    }
+}
+
+impl VotePrfKey {
+    /// Uses a shared 32-byte secret as the PRF key.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Uses a software hotkey's spending key bytes, as earlier releases did.
+    pub fn from_spending_key(sk: &SpendingKey) -> Self {
+        Self(*sk.to_bytes())
+    }
 }
 
 fn next_proposal_authority(
@@ -465,7 +497,28 @@ pub fn derive_vote_authority_transition(
     proposal_id: u64,
     proposal_authority_old: u64,
 ) -> Result<VoteAuthorityTransition, VoteProofBuildError> {
-    let fvk: FullViewingKey = sk.into();
+    derive_vote_authority_transition_from_fvk(
+        &sk.into(),
+        address_index,
+        total_note_value,
+        van_comm_rand,
+        voting_round_id,
+        proposal_id,
+        proposal_authority_old,
+    )
+}
+
+/// [`derive_vote_authority_transition`] for a key known only by its full
+/// viewing key, such as one held as threshold shares.
+pub fn derive_vote_authority_transition_from_fvk(
+    fvk: &FullViewingKey,
+    address_index: u32,
+    total_note_value: u64,
+    van_comm_rand: pallas::Base,
+    voting_round_id: pallas::Base,
+    proposal_id: u64,
+    proposal_authority_old: u64,
+) -> Result<VoteAuthorityTransition, VoteProofBuildError> {
     let address = fvk.address_at(address_index, Scope::External);
     let g_d = voting_crypto_deps::diversified_base(&address).to_affine();
     let pk_d =
@@ -500,7 +553,7 @@ pub fn derive_vote_authority_transition(
 /// voting on the same proposal would derive identical El Gamal nonces,
 /// enabling a classic nonce-reuse attack on the ciphertexts.
 fn vote_share_prf(
-    sk: &SpendingKey,
+    prf_key: &VotePrfKey,
     domain: u8,
     round_id: pallas::Base,
     proposal_id: u64,
@@ -511,7 +564,7 @@ fn vote_share_prf(
         .hash_length(64)
         .personal(domain_tags::VOTE_PRF_PERSONALIZATION)
         .to_state()
-        .update(sk.to_bytes())
+        .update(&prf_key.0)
         .update(&[domain])
         .update(&round_id.to_repr())
         .update(&proposal_id.to_le_bytes())
@@ -530,7 +583,7 @@ fn vote_share_prf(
 /// We reduce mod p_base first; since p_base < q_scalar on the Pallas curve,
 /// every Base element is representable as a Scalar.
 fn derive_share_randomness(
-    sk: &SpendingKey,
+    prf_key: &VotePrfKey,
     round_id: pallas::Base,
     proposal_id: u64,
     van_commitment: pallas::Base,
@@ -543,7 +596,7 @@ fn derive_share_randomness(
         domain_tags::VOTE_PRF_DOMAIN_ELGAMAL
     };
     let hash = vote_share_prf(
-        sk,
+        prf_key,
         domain,
         round_id,
         proposal_id,
@@ -562,14 +615,14 @@ fn derive_share_randomness(
 
 /// Derive deterministic blind factor `blind_i` for a share commitment.
 fn derive_share_blind(
-    sk: &SpendingKey,
+    prf_key: &VotePrfKey,
     round_id: pallas::Base,
     proposal_id: u64,
     van_commitment: pallas::Base,
     share_index: u8,
 ) -> pallas::Base {
     let hash = vote_share_prf(
-        sk,
+        prf_key,
         domain_tags::VOTE_PRF_DOMAIN_BLIND,
         round_id,
         proposal_id,
@@ -594,7 +647,7 @@ fn derive_share_blind(
 /// pseudorandom data, which is consumed 4 bytes at a time for modular indices.
 fn deterministic_shuffle(
     shares: &mut [u64; NUM_SHARES],
-    sk: &SpendingKey,
+    prf_key: &VotePrfKey,
     round_id: pallas::Base,
     proposal_id: u64,
     van_commitment: pallas::Base,
@@ -603,7 +656,7 @@ fn deterministic_shuffle(
     // function only needs one PRF call to seed the entire Fisher
     // Yates shuffle. It doesn't need per-share derivations.
     let seed = vote_share_prf(
-        sk,
+        prf_key,
         domain_tags::VOTE_PRF_DOMAIN_SHUFFLE,
         round_id,
         proposal_id,
@@ -695,6 +748,52 @@ pub fn build_vote_proof_from_delegation(
     proposal_authority_old_u64: u64,
     single_share: bool,
 ) -> Result<VoteProofBundle, VoteProofBuildError> {
+    build_vote_proof_from_fvk(
+        &sk.into(),
+        &VotePrfKey::from_spending_key(sk),
+        address_index,
+        total_note_value,
+        van_comm_rand,
+        voting_round_id,
+        vote_comm_tree_path,
+        vote_comm_tree_position,
+        anchor_height,
+        proposal_id,
+        vote_decision,
+        ea_pk,
+        alpha_v,
+        proposal_authority_old_u64,
+        single_share,
+    )
+}
+
+/// Build a vote proof (ZKP #2) for a voting key known by its full viewing key.
+///
+/// The spending key never enters the proof: the circuit witnesses `ak` from
+/// `fvk`, and the vote is authorized by a RedPallas signature under the
+/// returned `r_vpk = ak + [alpha_v] * SpendAuthG`, made by whoever controls
+/// the key. That signer can be a set of FROST participants who choose
+/// `alpha_v` together before signing. `prf_key` keys the deterministic share
+/// derivation; see [`VotePrfKey`].
+///
+/// Otherwise identical to [`build_vote_proof_from_delegation`].
+pub fn build_vote_proof_from_fvk(
+    fvk: &FullViewingKey,
+    prf_key: &VotePrfKey,
+    address_index: u32,
+    total_note_value: u64,
+    van_comm_rand: pallas::Base,
+    voting_round_id: pallas::Base,
+    vote_comm_tree_path: [pallas::Base; VOTE_COMM_TREE_DEPTH],
+    vote_comm_tree_position: u32,
+    anchor_height: u32,
+    proposal_id: u64,
+    vote_decision: u64,
+    ea_pk: pallas::Affine,
+    alpha_v: pallas::Scalar,
+    proposal_authority_old_u64: u64,
+    single_share: bool,
+) -> Result<VoteProofBundle, VoteProofBuildError> {
     let proposal_authority_new_u64 =
         next_proposal_authority(proposal_authority_old_u64, proposal_id)?;
 
@@ -705,10 +804,8 @@ pub fn build_vote_proof_from_delegation(
 
     // ---- Key derivation (matches delegation's key hierarchy) ----
 
-    let vsk = extract_vsk(sk);
-    let fvk: FullViewingKey = sk.into();
-    let vsk_nk = voting_crypto_deps::nullifier_key(&fvk).circuit_value();
-    let rivk_v = voting_crypto_deps::viewing_randomness(&fvk, Scope::External).circuit_value();
+    let vsk_nk = voting_crypto_deps::nullifier_key(fvk).circuit_value();
+    let rivk_v = voting_crypto_deps::viewing_randomness(fvk, Scope::External).circuit_value();
 
     let address = fvk.address_at(address_index, Scope::External);
     let vpk_g_d = voting_crypto_deps::diversified_base(&address);
@@ -724,6 +821,14 @@ pub fn build_vote_proof_from_delegation(
     let vpk_g_d_x = *vpk_g_d_coords.x();
     let vpk_pk_d_x = *vpk_pk_d_coords.x();
 
+    // ---- Spend validating key, from the FVK (no spending key needed) ----
+    let fvk_bytes = fvk.to_bytes();
+    let ak_bytes: [u8; 32] = fvk_bytes[0..32].try_into().expect("FVK encodes ak first");
+    let vsk_ak: pallas::Affine =
+        Option::<pallas::Point>::from(pallas::Point::from_bytes(&ak_bytes))
+            .expect("an FVK's ak is a valid point")
+            .to_affine();
+
     // ---- Fast key-chain consistency checks (instant, no circuit) ----
     {
         use crate::encoding::byte_bits;
@@ -731,23 +836,9 @@ pub fn build_vote_proof_from_delegation(
         use voting_crypto_deps::composition::{COMMIT_IVK_PERSONALIZATION, L_ORCHARD_BASE};
         use voting_crypto_deps::halo2_gadgets::sinsemilla::primitives::CommitDomain;
 
-        // Check 1: [vsk] * SpendAuthG must match the ak from the FullViewingKey.
-        let ak_from_vsk = (spend_auth_g_affine() * vsk).to_affine();
-        let fvk_bytes = fvk.to_bytes();
-        let ak_from_fvk_bytes: [u8; 32] = fvk_bytes[0..32].try_into().unwrap();
-        let ak_from_fvk: pallas::Affine = {
-            let opt: Option<pallas::Point> = pallas::Point::from_bytes(&ak_from_fvk_bytes).into();
-            opt.expect("ak from fvk must be a valid point").to_affine()
-        };
-        assert_eq!(
-            ak_from_vsk, ak_from_fvk,
-            "extract_vsk bug: [vsk]*SpendAuthG != ak from FullViewingKey"
-        );
-
         // Check 2: CommitIvk(ak_x, nk, rivk) must produce an ivk where [ivk]*g_d == pk_d.
-        let ak_from_vsk_coords = pallas_coordinates(ak_from_vsk)
-            .expect("valid Orchard spending keys have nonzero spend authorizing keys");
-        let ak_x = *ak_from_vsk_coords.x();
+        let ak_coords = pallas_coordinates(vsk_ak).expect("an FVK's ak is not the identity");
+        let ak_x = *ak_coords.x();
         let domain = CommitDomain::new(COMMIT_IVK_PERSONALIZATION);
         let ivk = domain
             .short_commit(
@@ -812,14 +903,14 @@ pub fn build_vote_proof_from_delegation(
     } else {
         let mut s = denomination_split(
             num_ballots,
-            sk,
+            prf_key,
             voting_round_id,
             proposal_id,
             vote_authority_note_old,
         );
         deterministic_shuffle(
             &mut s,
-            sk,
+            prf_key,
             voting_round_id,
             proposal_id,
             vote_authority_note_old,
@@ -862,7 +953,7 @@ pub fn build_vote_proof_from_delegation(
 
     for i in 0..16 {
         let r = derive_share_randomness(
-            sk,
+            prf_key,
             voting_round_id,
             proposal_id,
             vote_authority_note_old,
@@ -892,7 +983,7 @@ pub fn build_vote_proof_from_delegation(
 
     let share_blinds: [pallas::Base; 16] = core::array::from_fn(|i| {
         derive_share_blind(
-            sk,
+            prf_key,
             voting_round_id,
             proposal_id,
             vote_authority_note_old,
@@ -910,9 +1001,10 @@ pub fn build_vote_proof_from_delegation(
     });
     let shares_hash_val = shares_hash(share_blinds, enc_c1_x, enc_c2_x, enc_c1_y, enc_c2_y);
 
-    // ---- Condition 4: r_vpk = ak + [alpha_v] * G = [vsk + alpha_v] * G ----
-    // alpha_v is now provided by the caller so they can sign with rsk_v.
-    let r_vpk = (spend_auth_g_affine() * (vsk + alpha_v)).to_affine();
+    // ---- Condition 4: r_vpk = ak + [alpha_v] * G ----
+    // alpha_v is provided by the caller so the key's controller can sign with
+    // rsk_v = ask_v + alpha_v, alone or as threshold shares.
+    let r_vpk = (vsk_ak + spend_auth_g_affine() * alpha_v).to_affine();
     let r_vpk_coords =
         pallas_coordinates(r_vpk).ok_or(VoteProofBuildError::InvalidRandomizedVotingPublicKey)?;
     let r_vpk_x = *r_vpk_coords.x();
@@ -959,7 +1051,7 @@ pub fn build_vote_proof_from_delegation(
         Value::known(proposal_authority_old),
         Value::known(van_comm_rand),
         Value::known(vote_authority_note_old),
-        Value::known(vsk),
+        Value::known(vsk_ak),
         Value::known(rivk_v),
         Value::known(vsk_nk),
         Value::known(alpha_v),
@@ -1028,7 +1120,7 @@ mod tests {
     #[test]
     fn vote_share_prf_has_frozen_test_vector() {
         let hash = vote_share_prf(
-            &test_sk(),
+            &VotePrfKey::from_spending_key(&test_sk()),
             crate::domain_tags::VOTE_PRF_DOMAIN_ELGAMAL,
             test_round_id(),
             1,
@@ -1233,7 +1325,7 @@ mod tests {
             van_comm_rand,
         );
         let r = derive_share_randomness(
-            &sk,
+            &VotePrfKey::from_spending_key(&sk),
             voting_round_id,
             proposal_id,
             vote_authority_note_old,
@@ -1305,8 +1397,22 @@ mod tests {
         let round_id = test_round_id();
         let van = test_van();
         for single_share in [false, true] {
-            let a = derive_share_randomness(&sk, round_id, 1, van, 0, single_share);
-            let b = derive_share_randomness(&sk, round_id, 1, van, 0, single_share);
+            let a = derive_share_randomness(
+                &VotePrfKey::from_spending_key(&sk),
+                round_id,
+                1,
+                van,
+                0,
+                single_share,
+            );
+            let b = derive_share_randomness(
+                &VotePrfKey::from_spending_key(&sk),
+                round_id,
+                1,
+                van,
+                0,
+                single_share,
+            );
             assert_eq!(a, b);
         }
     }
@@ -1317,8 +1423,22 @@ mod tests {
         let round_id = test_round_id();
         let van = test_van();
         for i in 0..16u8 {
-            let standard_r = derive_share_randomness(&sk, round_id, 1, van, i, false);
-            let single_r = derive_share_randomness(&sk, round_id, 1, van, i, true);
+            let standard_r = derive_share_randomness(
+                &VotePrfKey::from_spending_key(&sk),
+                round_id,
+                1,
+                van,
+                i,
+                false,
+            );
+            let single_r = derive_share_randomness(
+                &VotePrfKey::from_spending_key(&sk),
+                round_id,
+                1,
+                van,
+                i,
+                true,
+            );
             let standard_c1 = spend_auth_g_affine()
                 * base_to_scalar(standard_r).expect("standard randomness must be scalar-range");
             let single_c1 = spend_auth_g_affine()
@@ -1335,8 +1455,8 @@ mod tests {
         let sk = test_sk();
         let round_id = test_round_id();
         let van = test_van();
-        let a = derive_share_blind(&sk, round_id, 1, van, 0);
-        let b = derive_share_blind(&sk, round_id, 1, van, 0);
+        let a = derive_share_blind(&VotePrfKey::from_spending_key(&sk), round_id, 1, van, 0);
+        let b = derive_share_blind(&VotePrfKey::from_spending_key(&sk), round_id, 1, van, 0);
         assert_eq!(a, b);
     }
 
@@ -1346,7 +1466,14 @@ mod tests {
         let round_id = test_round_id();
         let van = test_van();
         for i in 0..16u8 {
-            let r = derive_share_randomness(&sk, round_id, 1, van, i, false);
+            let r = derive_share_randomness(
+                &VotePrfKey::from_spending_key(&sk),
+                round_id,
+                1,
+                van,
+                i,
+                false,
+            );
             assert!(
                 bool::from(!r.is_zero()),
                 "r_{} must be non-zero for the circuit hardening gate",
@@ -1365,12 +1492,26 @@ mod tests {
         let sk = test_sk();
         let round_id = test_round_id();
         let van = test_van();
-        let r0 = derive_share_randomness(&sk, round_id, 1, van, 0, false);
-        let r1 = derive_share_randomness(&sk, round_id, 1, van, 1, false);
+        let r0 = derive_share_randomness(
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+            0,
+            false,
+        );
+        let r1 = derive_share_randomness(
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+            1,
+            false,
+        );
         assert_ne!(r0, r1);
 
-        let b0 = derive_share_blind(&sk, round_id, 1, van, 0);
-        let b1 = derive_share_blind(&sk, round_id, 1, van, 1);
+        let b0 = derive_share_blind(&VotePrfKey::from_spending_key(&sk), round_id, 1, van, 0);
+        let b1 = derive_share_blind(&VotePrfKey::from_spending_key(&sk), round_id, 1, van, 1);
         assert_ne!(b0, b1);
     }
 
@@ -1379,8 +1520,22 @@ mod tests {
         let sk = test_sk();
         let round_id = test_round_id();
         let van = test_van();
-        let r_p1 = derive_share_randomness(&sk, round_id, 1, van, 0, false);
-        let r_p2 = derive_share_randomness(&sk, round_id, 2, van, 0, false);
+        let r_p1 = derive_share_randomness(
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+            0,
+            false,
+        );
+        let r_p2 = derive_share_randomness(
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            2,
+            van,
+            0,
+            false,
+        );
         assert_ne!(r_p1, r_p2);
     }
 
@@ -1388,8 +1543,22 @@ mod tests {
     fn different_round_id_gives_different_values() {
         let sk = test_sk();
         let van = test_van();
-        let r_a = derive_share_randomness(&sk, pallas::Base::from(1u64), 1, van, 0, false);
-        let r_b = derive_share_randomness(&sk, pallas::Base::from(2u64), 1, van, 0, false);
+        let r_a = derive_share_randomness(
+            &VotePrfKey::from_spending_key(&sk),
+            pallas::Base::from(1u64),
+            1,
+            van,
+            0,
+            false,
+        );
+        let r_b = derive_share_randomness(
+            &VotePrfKey::from_spending_key(&sk),
+            pallas::Base::from(2u64),
+            1,
+            van,
+            0,
+            false,
+        );
         assert_ne!(r_a, r_b);
     }
 
@@ -1398,8 +1567,15 @@ mod tests {
         let sk = test_sk();
         let round_id = test_round_id();
         let van = test_van();
-        let r = derive_share_randomness(&sk, round_id, 1, van, 0, false);
-        let b = derive_share_blind(&sk, round_id, 1, van, 0);
+        let r = derive_share_randomness(
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+            0,
+            false,
+        );
+        let b = derive_share_blind(&VotePrfKey::from_spending_key(&sk), round_id, 1, van, 0);
         assert_ne!(r, b, "domain separation must prevent r == blind");
     }
 
@@ -1409,10 +1585,19 @@ mod tests {
         let round_id = test_round_id();
         let van = test_van();
         let randoms: Vec<_> = (0..16u8)
-            .map(|i| derive_share_randomness(&sk, round_id, 1, van, i, false))
+            .map(|i| {
+                derive_share_randomness(
+                    &VotePrfKey::from_spending_key(&sk),
+                    round_id,
+                    1,
+                    van,
+                    i,
+                    false,
+                )
+            })
             .collect();
         let blinds: Vec<_> = (0..16u8)
-            .map(|i| derive_share_blind(&sk, round_id, 1, van, i))
+            .map(|i| derive_share_blind(&VotePrfKey::from_spending_key(&sk), round_id, 1, van, i))
             .collect();
         for i in 0..16 {
             for j in (i + 1)..16 {
@@ -1429,12 +1614,28 @@ mod tests {
         let van_a = pallas::Base::from(0xAAAA_u64);
         let van_b = pallas::Base::from(0xBBBB_u64);
         for i in 0..16u8 {
-            let r_a = derive_share_randomness(&sk, round_id, 1, van_a, i, false);
-            let r_b = derive_share_randomness(&sk, round_id, 1, van_b, i, false);
+            let r_a = derive_share_randomness(
+                &VotePrfKey::from_spending_key(&sk),
+                round_id,
+                1,
+                van_a,
+                i,
+                false,
+            );
+            let r_b = derive_share_randomness(
+                &VotePrfKey::from_spending_key(&sk),
+                round_id,
+                1,
+                van_b,
+                i,
+                false,
+            );
             assert_ne!(r_a, r_b, "r_{} must differ across VANs", i);
 
-            let b_a = derive_share_blind(&sk, round_id, 1, van_a, i);
-            let b_b = derive_share_blind(&sk, round_id, 1, van_b, i);
+            let b_a =
+                derive_share_blind(&VotePrfKey::from_spending_key(&sk), round_id, 1, van_a, i);
+            let b_b =
+                derive_share_blind(&VotePrfKey::from_spending_key(&sk), round_id, 1, van_b, i);
             assert_ne!(b_a, b_b, "blind_{} must differ across VANs", i);
         }
     }
@@ -1475,7 +1676,7 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(0, &sk, rid, 1, van);
+        let shares = denomination_split(0, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("0 ballots", &shares);
         assert_eq!(shares, [0; 16]);
     }
@@ -1487,7 +1688,7 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(1, &sk, rid, 1, van);
+        let shares = denomination_split(1, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("1 ballot (0.125 ZEC)", &shares);
         assert_eq!(shares[0], 1);
         for i in 1..16 {
@@ -1502,7 +1703,7 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(4, &sk, rid, 1, van);
+        let shares = denomination_split(4, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("4 ballots (0.5 ZEC)", &shares);
         assert_eq!(shares[0..4], [1; 4]);
         for i in 4..16 {
@@ -1517,7 +1718,7 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(8, &sk, rid, 1, van);
+        let shares = denomination_split(8, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("8 ballots (1 ZEC)", &shares);
         assert_eq!(shares[0..8], [1; 8]);
         for i in 8..16 {
@@ -1532,7 +1733,7 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(50, &sk, rid, 1, van);
+        let shares = denomination_split(50, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("50 ballots (6.25 ZEC)", &shares);
         assert_eq!(shares[0..5], [10; 5]);
         for i in 5..16 {
@@ -1547,7 +1748,7 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(11_111, &sk, rid, 1, van);
+        let shares = denomination_split(11_111, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("11,111 ballots (1,388.9 ZEC)", &shares);
         assert_eq!(shares[0], 10_000);
         assert_eq!(shares[1], 1_000);
@@ -1568,7 +1769,7 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(4_800, &sk, rid, 1, van);
+        let shares = denomination_split(4_800, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("4,800 ballots (600 ZEC)", &shares);
         assert_eq!(shares[0..4], [1_000; 4]);
         assert_eq!(shares[4..9], [100; 5]);
@@ -1589,7 +1790,7 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(999, &sk, rid, 1, van);
+        let shares = denomination_split(999, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("999 ballots (124.875 ZEC)", &shares);
         assert_eq!(shares[0..9], [100; 9]);
         let remainder_sum: u64 = shares[9..16].iter().sum();
@@ -1606,7 +1807,8 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(3_000_000, &sk, rid, 1, van);
+        let shares =
+            denomination_split(3_000_000, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("3M ballots (375 ZEC)", &shares);
         assert_eq!(shares[0..3], [1_000_000; 3]);
         for i in 3..16 {
@@ -1621,7 +1823,8 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(8_000_000, &sk, rid, 1, van);
+        let shares =
+            denomination_split(8_000_000, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("8M ballots (1M ZEC)", &shares);
         assert_eq!(shares[0..8], [1_000_000; 8]);
         for i in 8..16 {
@@ -1636,7 +1839,8 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(90_000_000, &sk, rid, 1, van);
+        let shares =
+            denomination_split(90_000_000, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("90M ballots (11.25M ZEC)", &shares);
         assert_eq!(shares[0..9], [10_000_000; 9]);
         for i in 9..16 {
@@ -1653,7 +1857,13 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(100_000_000, &sk, rid, 1, van);
+        let shares = denomination_split(
+            100_000_000,
+            &VotePrfKey::from_spending_key(&sk),
+            rid,
+            1,
+            van,
+        );
         show("100M ballots (12.5M ZEC)", &shares);
         assert_eq!(shares[0..9], [10_000_000; 9]);
         let remainder_sum: u64 = shares[9..16].iter().sum();
@@ -1671,7 +1881,8 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(1_234_567, &sk, rid, 1, van);
+        let shares =
+            denomination_split(1_234_567, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("1,234,567 ballots (154K ZEC)", &shares);
         assert_eq!(shares[0], 1_000_000);
         assert_eq!(shares[1..3], [100_000; 2]);
@@ -1690,7 +1901,8 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let shares = denomination_split(10_000_003, &sk, rid, 1, van);
+        let shares =
+            denomination_split(10_000_003, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         show("10,000,003 ballots", &shares);
         assert_eq!(shares[0], 10_000_000);
         let remainder_sum: u64 = shares[1..16].iter().sum();
@@ -1722,7 +1934,7 @@ mod tests {
             168_000_000,
         ];
         for &v in &test_values {
-            let shares = denomination_split(v, &sk, rid, 1, van);
+            let shares = denomination_split(v, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
             assert_eq!(
                 shares.iter().sum::<u64>(),
                 v,
@@ -1748,7 +1960,7 @@ mod tests {
             168_000_000,
         ];
         for &v in &test_values {
-            let shares = denomination_split(v, &sk, rid, 1, van);
+            let shares = denomination_split(v, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
             for (i, &s) in shares.iter().enumerate() {
                 assert!(
                     s < SHARE_VALUE_LIMIT,
@@ -1768,8 +1980,8 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let a = denomination_split(999, &sk, rid, 1, van);
-        let b = denomination_split(999, &sk, rid, 1, van);
+        let a = denomination_split(999, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
+        let b = denomination_split(999, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
         assert_eq!(a, b);
     }
 
@@ -1779,8 +1991,8 @@ mod tests {
         let sk = test_sk();
         let rid = test_round_id();
         let van = test_van();
-        let a = denomination_split(999, &sk, rid, 1, van);
-        let b = denomination_split(999, &sk, rid, 2, van);
+        let a = denomination_split(999, &VotePrfKey::from_spending_key(&sk), rid, 1, van);
+        let b = denomination_split(999, &VotePrfKey::from_spending_key(&sk), rid, 2, van);
         show("999 ballots, proposal 1", &a);
         show("999 ballots, proposal 2", &b);
         assert_eq!(a[0..9], b[0..9], "denomination slots should be identical");
@@ -1798,8 +2010,8 @@ mod tests {
         let rid = test_round_id();
         let van_a = pallas::Base::from(0xAAAA_u64);
         let van_b = pallas::Base::from(0xBBBB_u64);
-        let a = denomination_split(999, &sk, rid, 1, van_a);
-        let b = denomination_split(999, &sk, rid, 1, van_b);
+        let a = denomination_split(999, &VotePrfKey::from_spending_key(&sk), rid, 1, van_a);
+        let b = denomination_split(999, &VotePrfKey::from_spending_key(&sk), rid, 1, van_b);
         show("999 ballots, VAN A", &a);
         show("999 ballots, VAN B", &b);
         assert_eq!(a[0..9], b[0..9], "denomination slots should be identical");
@@ -1813,9 +2025,21 @@ mod tests {
         let sk = test_sk();
         let round_id = test_round_id();
         let van = test_van();
-        let mut shares = denomination_split(8_234_567, &sk, round_id, 1, van);
+        let mut shares = denomination_split(
+            8_234_567,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+        );
         let sum_before = shares.iter().sum::<u64>();
-        deterministic_shuffle(&mut shares, &sk, round_id, 1, van);
+        deterministic_shuffle(
+            &mut shares,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+        );
         assert_eq!(shares.iter().sum::<u64>(), sum_before);
     }
 
@@ -1824,9 +2048,16 @@ mod tests {
         let sk = test_sk();
         let round_id = test_round_id();
         let van = test_van();
-        let original = denomination_split(4_800, &sk, round_id, 1, van);
+        let original =
+            denomination_split(4_800, &VotePrfKey::from_spending_key(&sk), round_id, 1, van);
         let mut shuffled = original;
-        deterministic_shuffle(&mut shuffled, &sk, round_id, 1, van);
+        deterministic_shuffle(
+            &mut shuffled,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+        );
         let mut sorted_orig = original;
         sorted_orig.sort();
         let mut sorted_shuf = shuffled;
@@ -1839,10 +2070,24 @@ mod tests {
         let sk = test_sk();
         let round_id = test_round_id();
         let van = test_van();
-        let mut a = denomination_split(4_800, &sk, round_id, 1, van);
-        let mut b = denomination_split(4_800, &sk, round_id, 1, van);
-        deterministic_shuffle(&mut a, &sk, round_id, 1, van);
-        deterministic_shuffle(&mut b, &sk, round_id, 1, van);
+        let mut a =
+            denomination_split(4_800, &VotePrfKey::from_spending_key(&sk), round_id, 1, van);
+        let mut b =
+            denomination_split(4_800, &VotePrfKey::from_spending_key(&sk), round_id, 1, van);
+        deterministic_shuffle(
+            &mut a,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+        );
+        deterministic_shuffle(
+            &mut b,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+        );
         assert_eq!(a, b, "same inputs must produce same permutation");
     }
 
@@ -1851,10 +2096,24 @@ mod tests {
         let sk = test_sk();
         let round_id = test_round_id();
         let van = test_van();
-        let mut a = denomination_split(4_800, &sk, round_id, 1, van);
-        let mut b = denomination_split(4_800, &sk, round_id, 1, van);
-        deterministic_shuffle(&mut a, &sk, round_id, 1, van);
-        deterministic_shuffle(&mut b, &sk, round_id, 2, van);
+        let mut a =
+            denomination_split(4_800, &VotePrfKey::from_spending_key(&sk), round_id, 1, van);
+        let mut b =
+            denomination_split(4_800, &VotePrfKey::from_spending_key(&sk), round_id, 1, van);
+        deterministic_shuffle(
+            &mut a,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+        );
+        deterministic_shuffle(
+            &mut b,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            2,
+            van,
+        );
         assert_ne!(
             a, b,
             "different proposals should produce different permutations"
@@ -1867,10 +2126,34 @@ mod tests {
         let round_id = test_round_id();
         let van_a = pallas::Base::from(0xAAAA_u64);
         let van_b = pallas::Base::from(0xBBBB_u64);
-        let mut a = denomination_split(4_800, &sk, round_id, 1, van_a);
-        let mut b = denomination_split(4_800, &sk, round_id, 1, van_b);
-        deterministic_shuffle(&mut a, &sk, round_id, 1, van_a);
-        deterministic_shuffle(&mut b, &sk, round_id, 1, van_b);
+        let mut a = denomination_split(
+            4_800,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van_a,
+        );
+        let mut b = denomination_split(
+            4_800,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van_b,
+        );
+        deterministic_shuffle(
+            &mut a,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van_a,
+        );
+        deterministic_shuffle(
+            &mut b,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van_b,
+        );
         assert_ne!(a, b, "different VANs should produce different permutations");
     }
 
@@ -1879,9 +2162,16 @@ mod tests {
         let sk = test_sk();
         let round_id = test_round_id();
         let van = test_van();
-        let original = denomination_split(4_800, &sk, round_id, 1, van);
+        let original =
+            denomination_split(4_800, &VotePrfKey::from_spending_key(&sk), round_id, 1, van);
         let mut shuffled = original;
-        deterministic_shuffle(&mut shuffled, &sk, round_id, 1, van);
+        deterministic_shuffle(
+            &mut shuffled,
+            &VotePrfKey::from_spending_key(&sk),
+            round_id,
+            1,
+            van,
+        );
         assert_ne!(
             original, shuffled,
             "shuffle should reorder (vanishingly unlikely to be identity for 12 non-zero shares)"

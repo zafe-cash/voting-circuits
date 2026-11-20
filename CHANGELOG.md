@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Changed
+
+- **Breaking:** The vote proof witnesses the voting key's `ak` as a
+  non-identity point instead of its spending scalar `vsk` (conditions 3-4), as
+  ZKP 1 and the Orchard action circuit do. Vote authority is still the
+  signature under `r_vpk`, verified out of circuit. Keys held as threshold
+  shares (FROST) can now vote. Removes one fixed column; the row high-water
+  mark and K=11 are unchanged. This changes the vote-proof proving and
+  verifying keys; the delegation and share-reveal keys are unchanged.
+
+### Added
+
+- `build_vote_proof_from_fvk`, `derive_vote_authority_transition_from_fvk` and
+  `VotePrfKey`: build a vote proof from a full viewing key and a caller-held
+  PRF secret. `build_vote_proof_from_delegation` keeps its signature and
+  derives the same shares as before.
+
 ## v0.15.0
 
 ### Changed

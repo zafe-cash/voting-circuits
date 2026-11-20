@@ -5,18 +5,17 @@
 //!
 //! - **ZKP #1 (delegation)**: Condition 4 (spend authority: `[alpha]*SpendAuthG + ak_P` → rk),
 //!   Condition 5 (CommitIvk & diversified address: `pk_d_signed = [ivk]*g_d_signed`).
-//! - **ZKP #2 (vote proof)**: Condition 3 (spend authority: `ak = ExtractP([vsk]*SpendAuthG)`;
+//! - **ZKP #2 (vote proof)**: Condition 3 (spend authority: `ak = ExtractP(vsk_ak)`, a witnessed point;
 //!   address ownership: `vpk_pk_d = [ivk_v]*vpk_g_d` via CommitIvk).
 //!
 //! The same CommitIvk + pk_d derivation pattern is used in the main Orchard action
 //! circuit for spend authority and diversified address integrity.
 
 use voting_crypto_deps::composition::{
-    CommitIvkChip, OrchardCommitDomains, OrchardFixedBases, OrchardFixedBasesFull,
-    OrchardHashDomains,
+    CommitIvkChip, OrchardCommitDomains, OrchardFixedBases, OrchardHashDomains,
 };
 use voting_crypto_deps::halo2_gadgets::{
-    ecc::{chip::EccChip, NonIdentityPoint, Point, ScalarFixed, ScalarVar},
+    ecc::{chip::EccChip, NonIdentityPoint, ScalarFixed, ScalarVar},
     sinsemilla::chip::SinsemillaChip,
 };
 use voting_crypto_deps::halo2_proofs::{
@@ -24,35 +23,6 @@ use voting_crypto_deps::halo2_proofs::{
     plonk::Error,
 };
 use voting_crypto_deps::pasta_curves::pallas;
-
-// ================================================================
-// SpendAuthG fixed-base multiplication
-// ================================================================
-
-/// Computes `[scalar] * SpendAuthG` using the Orchard fixed base.
-///
-/// Thin wrapper around the shared gadget in `crate::gadgets::spend_authority` –
-/// see [`crate::gadgets::spend_authority`] for the upstream reference.
-///
-/// Used by delegation (condition 4: alpha), vote proof (condition 3: vsk).
-/// Returns the resulting curve point so the caller can e.g. add `ak_P` for rk
-/// (delegation) or call `extract_p()` for ak (vote proof).
-pub(crate) fn spend_auth_g_mul(
-    ecc_chip: EccChip<OrchardFixedBases>,
-    layouter: impl Layouter<pallas::Base>,
-    _label: &str,
-    scalar: ScalarFixed<pallas::Affine, EccChip<OrchardFixedBases>>,
-) -> Result<Point<pallas::Affine, EccChip<OrchardFixedBases>>, Error> {
-    // The shared crate's prove_spend_authority does [scalar]*SpendAuthG + ak_P.
-    // For call sites that only need the [scalar]*SpendAuthG multiplication
-    // (e.g. vote proof's [vsk]*SpendAuthG to derive ak), we use the same
-    // underlying gadget via a dedicated mul helper.
-    use voting_crypto_deps::halo2_gadgets::ecc::FixedPoint;
-    let spend_auth_g = OrchardFixedBasesFull::SpendAuthG;
-    let spend_auth_g = FixedPoint::from_inner(ecc_chip, spend_auth_g);
-    let (point, _) = spend_auth_g.mul(layouter, scalar)?;
-    Ok(point)
-}
 
 // ================================================================
 // Prove address ownership (CommitIvk + [ivk]*g_d → constrain pk_d)
@@ -72,7 +42,7 @@ pub(crate) fn spend_auth_g_mul(
 /// * `commit_ivk_chip` – CommitIvk chip (canonicity gates).
 /// * `layouter` – Circuit layouter.
 /// * `label` – Namespace label for the region.
-/// * `ak` – Spend validating key x-coordinate (e.g. `ExtractP(ak_P)` or `ExtractP([vsk]*SpendAuthG)`).
+/// * `ak` – Spend validating key x-coordinate (`ExtractP` of a witnessed `ak_P` / `vsk_ak`).
 /// * `nk` – Nullifier deriving key.
 /// * `rivk` – CommitIvk randomness.
 /// * `g_d` – Diversified base (non-identity point).

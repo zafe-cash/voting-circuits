@@ -40,7 +40,7 @@ Domain-tag encoding is owned by `crate::domain_tags`.
    * **vote_authority_note_old**: the old VAN commitment (two-layer Poseidon hash, same structure as ZKP 1 van_comm).
    * **vote_comm_tree_path**: Poseidon-based Merkle authentication path (24 sibling hashes).
    * **vote_comm_tree_position**: leaf position in the vote commitment tree.
-   * **vsk**: voting spending key (scalar for ECC multiplication). Used in condition 3 for `[vsk] * SpendAuthG`.
+   * **vsk_ak**: voting spend validating key `vsk.ak` (full affine point, witnessed as `NonIdentityPoint`). Used in condition 3 for CommitIvk and in condition 4 for `r_vpk`. The spending scalar is not a witness, so a key held as threshold shares (e.g. FROST) can vote: authority is the vote signature under `r_vpk`, as in the Orchard action circuit and ZKP 1.
    * **rivk_v**: CommitIvk randomness (scalar). Blinding factor for `CommitIvk(ak, nk, rivk_v)` in condition 3.
    * **vsk_nk**: nullifier deriving key. Concretely `voting_crypto_deps::nullifier_key(&fvk).circuit_value()` — the standard Orchard `NullifierDerivingKey` derived from the spending key via `PRF_expand_nk(sk)`. The "vsk" prefix reflects its role in the voting key hierarchy (shared between condition 3's CommitIvk and condition 5's nullifier), not distinct key material. It is structurally identical to the `nk` used in ZKP 1's governance nullifier; cross-circuit uniqueness is ensured by condition 5's direct VAN nullifier tag and ZKP 1's derived `dom`.
 
@@ -148,19 +148,19 @@ Identical to the delegation circuit's `q_imt_swap` gate.
 
 ## Condition 3: Diversified Address Integrity ✅
 
-Purpose: prove the voter controls the voting hotkey address delegated to in Phase 1–2 (spec: Diversified Address Integrity). Uses the same CommitIvk chain as ZKP 1 (delegation) condition 5, implemented via the shared **`circuit::address_ownership`** gadget (ZKP 1 and ZKP 2 both call `spend_auth_g_mul` and `prove_address_ownership`).
+Purpose: prove the voter controls the voting hotkey address delegated to in Phase 1–2 (spec: Diversified Address Integrity). Uses the same CommitIvk chain as ZKP 1 (delegation) condition 5, implemented via the shared **`circuit::address_ownership`** gadget (ZKP 1 and ZKP 2 both witness `ak` as a point and call `prove_address_ownership`).
 
 ```
-vsk_ak      = [vsk] * SpendAuthG               (fixed-base ECC mul)
+vsk_ak      = witnessed non-identity point     (the voting key's ak)
 ak          = ExtractP(vsk_ak)                  (x-coordinate)
 ivk_v       = CommitIvk_rivk_v(ak, vsk.nk)     (Sinsemilla commitment)
 vpk_pk_d    = [ivk_v] * vpk_g_d                (variable-base ECC mul)
 ```
 
 Where:
-- **vsk**: voting spending key (private witness, `pallas::Scalar`). The secret key that authorizes vote casting.
+- **vsk_ak**: the voting key's spend validating key (private witness, `NonIdentityPoint`). The identity is rejected: a signature would verify under it trivially.
 - **SpendAuthG**: fixed generator point on the Pallas curve, reused from the Zcash Orchard protocol. Used both here (condition 3) and in condition 11 (El Gamal generator).
-- **ak**: the spend validating key's x-coordinate, derived in-circuit from `[vsk] * SpendAuthG` then `ExtractP`. Not a separate witness — it's an internal wire.
+- **ak**: the x-coordinate of `vsk_ak` (`ExtractP`). An internal wire.
 - **vsk_nk**: nullifier deriving key (private witness, `pallas::Base`). The same cell is shared with condition 5 (VAN nullifier keying). Witnessed before condition 3 in the synthesize flow.
 - **rivk_v**: CommitIvk randomness (private witness, `pallas::Scalar`). Blinding factor for the Sinsemilla commitment.
 - **ivk_v**: the incoming viewing key, derived in-circuit via `CommitIvk(ak, nk, rivk_v)`. Internal wire — flows from CommitIvk output to variable-base ECC mul input via `ScalarVar::from_base`.
@@ -168,37 +168,37 @@ Where:
 - **vpk_pk_d**: diversified transmission key (private witness, full affine point). Witnessed as `NonIdentityPoint`. Constrained to equal the derived `[ivk_v] * vpk_g_d` via `Point::constrain_equal`.
 
 **Structure:** Uses the shared `circuit::address_ownership` gadget:
-1. `spend_auth_g_mul(ecc_chip, layouter, "cond3: [vsk] SpendAuthG", vsk_scalar)` → `vsk_ak_point` (fixed-base scalar mul)
+1. `NonIdentityPoint::new(..., self.vsk_ak)` → `vsk_ak_point` (as ZKP 1 witnesses `ak_P`)
 2. `vsk_ak_point.extract_p()` → `ak` (x-coordinate extraction)
 3. `prove_address_ownership(..., ak, vsk_nk, rivk_v_scalar, &vpk_g_d_point, &vpk_pk_d_point)` — CommitIvk, `[ivk_v]*vpk_g_d`, and constrain to vpk_pk_d (same flow as ZKP 1 condition 5)
 
 **Chip dependencies:** `SinsemillaChip`, `CommitIvkChip`, `EccChip` (used inside the shared gadget). The Sinsemilla chip also loads the 10-bit lookup table used by conditions 6 and 9.
 
-**Constraint:** The circuit derives vpk_pk_d from vsk → ak → ivk_v → [ivk_v] * vpk_g_d and enforces full point equality with the witnessed vpk_pk_d. Since vpk_pk_d's x-coordinate flows into conditions 2 and 7 (VAN integrity hashes), and vpk_g_d's x-coordinate flows into the same hashes, any mismatch in the key hierarchy would break conditions 2/3/7 simultaneously.
+**Constraint:** The circuit derives vpk_pk_d from vsk_ak → ak → ivk_v → [ivk_v] * vpk_g_d and enforces full point equality with the witnessed vpk_pk_d. Since vpk_pk_d's x-coordinate flows into conditions 2 and 7 (VAN integrity hashes), and vpk_g_d's x-coordinate flows into the same hashes, any mismatch in the key hierarchy would break conditions 2/3/7 simultaneously.
 
 **Security properties:**
-- **Key binding:** The CommitIvk chain cryptographically binds vsk to the VAN address (vpk_g_d, vpk_pk_d). A prover who doesn't know vsk cannot produce a valid ivk_v that maps vpk_g_d to vpk_pk_d.
+- **Key binding:** The CommitIvk chain binds `vsk_ak` (with `vsk_nk`, `rivk_v`) to the VAN address (vpk_g_d, vpk_pk_d). Condition 4 binds the same point to `r_vpk`, and the verifier requires a vote signature under `r_vpk`, so only the holder of the key's spend authority, alone or as threshold shares, can cast a vote that verifies. This is the Orchard action circuit's model.
 - **Canonicity:** The CommitIvk gadget enforces canonical decomposition of ak and nk, preventing malleability attacks where different bit representations produce the same commitment.
 - **Non-identity:** Both vpk_g_d and vpk_pk_d are witnessed as `NonIdentityPoint`, ensuring they are not the curve identity (which would trivially satisfy the constraint for any ivk_v).
 - **Shared nk:** Using the same vsk_nk cell for both CommitIvk (condition 3) and the VAN nullifier (condition 5) ensures the nullifier is bound to the same key hierarchy that authorizes the vote.
 
 **Out-of-circuit helper:** `derive_voting_address(vsk, nk, rivk_v)` in tests performs the same computation: `[vsk] * SpendAuthG → ExtractP → CommitIvk → [ivk_v] * g_d`. Uses `CommitDomain::short_commit` from `halo2_gadgets::sinsemilla::primitives`.
 
-**Constructions:** Shared `circuit::address_ownership::spend_auth_g_mul` and `circuit::address_ownership::prove_address_ownership`; `SinsemillaChip`, `CommitIvkChip`, `EccChip`, `ScalarFixed`, `NonIdentityPoint`, `Point::constrain_equal`.
+**Constructions:** Shared `circuit::address_ownership::prove_address_ownership`; `SinsemillaChip`, `CommitIvkChip`, `EccChip`, `ScalarFixed`, `NonIdentityPoint`, `Point::constrain_equal`.
 
 ## Condition 4: Spend Authority ✅
 
-Purpose: bind the rerandomized voting public key `r_vpk` to the spending key and a randomizer so the verifier can check the vote signature out-of-circuit under `r_vpk`.
+Purpose: bind the rerandomized voting public key `r_vpk` to the voting key `vsk_ak` and a randomizer so the verifier can check the vote signature out-of-circuit under `r_vpk`.
 
 ```
-vsk_ak_point   = [vsk] * SpendAuthG        (from condition 3)
+vsk_ak_point   = witnessed vsk_ak          (from condition 3)
 alpha_v_commit = [alpha_v] * SpendAuthG    (fixed-base ECC mul)
 r_vpk_derived  = alpha_v_commit + vsk_ak_point
 constrain_instance(r_vpk_derived, R_VPK_X_PUBLIC_OFFSET), constrain_instance(r_vpk_derived.y(), R_VPK_Y_PUBLIC_OFFSET)
 ```
 
 Where:
-- **vsk_ak_point**: same point as in condition 3 (`[vsk]*SpendAuthG`), reused via the existing fixed-base mul.
+- **vsk_ak_point**: the point witnessed in condition 3, reused.
 - **alpha_v**: spend auth randomizer (private witness, `pallas::Scalar`). The
   circuit matches upstream Orchard and does not constrain this value non-zero;
   an honest wallet samples it freshly, while a zero witness is a documented
@@ -207,7 +207,7 @@ Where:
 
 **Constraint:** The circuit computes `r_vpk = vsk.ak + [alpha_v]*G` and constrains it to the public inputs `r_vpk_x`, `r_vpk_y`. The vote signature is verified out-of-circuit under `r_vpk` over the transaction sighash.
 
-**Constructions:** `spend_auth_g_mul` (same as condition 3), `Point::add`, `constrain_instance`.
+**Constructions:** shared `gadgets::spend_authority::prove_spend_authority` (fixed-base `[alpha_v]*SpendAuthG`, `Point::add`, `constrain_instance`).
 
 ## Condition 5: VAN Nullifier Integrity ✅
 

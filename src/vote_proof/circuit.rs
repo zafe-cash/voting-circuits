@@ -26,7 +26,7 @@
 //! - **Condition 2**: VAN Integrity — `vote_authority_note_old` is the two-layer
 //!   Poseidon hash (ZKP 1–compatible: core then finalize with rand). *(implemented)*
 //! - **Condition 3**: Diversified Address Integrity — `vpk_pk_d = [ivk_v] * vpk_g_d`
-//!   where `ivk_v = CommitIvk(ExtractP([vsk]*SpendAuthG), vsk.nk)`. *(implemented)*
+//!   where `ivk_v = CommitIvk(ExtractP(vsk_ak), vsk.nk)` with `vsk_ak` witnessed. *(implemented)*
 //! - **Condition 4**: Spend Authority — `r_vpk = vsk.ak + [alpha_v] * G`; enforced in-circuit (fixed-base mul + point add, `constrain_instance`).
 //! - **Condition 5**: VAN Nullifier Integrity — `van_nullifier` is correctly
 //!   derived from `vsk.nk`. *(implemented)*
@@ -78,7 +78,7 @@ use super::gadgets::authority_decrement::{AuthorityDecrementChip, AuthorityDecre
 use crate::{
     domain_tags,
     gadgets::{
-        address_ownership::{prove_address_ownership, spend_auth_g_mul},
+        address_ownership::prove_address_ownership,
         elgamal::{prove_elgamal_encryptions, EaPkInstanceLoc, SpendAuthGFixedBase30Config},
         nonzero::NonZeroConfig,
         poseidon_merkle::{synthesize_poseidon_merkle_path, MerkleSwapGate},
@@ -272,7 +272,7 @@ pub struct Config {
     /// ECC configuration for conditions 3 and 4.
     ///
     /// Condition 3 proves `vpk_pk_d = [ivk_v] * vpk_g_d` via the CommitIvk chain:
-    /// `[vsk] * SpendAuthG → ak → CommitIvk(ExtractP(ak), nk, rivk_v) → ivk_v → [ivk_v] * vpk_g_d`.
+    /// `vsk_ak → CommitIvk(ExtractP(vsk_ak), nk, rivk_v) → ivk_v → [ivk_v] * vpk_g_d`.
     /// Shares advice and fixed columns with Poseidon per delegation layout.
     ecc_config: EccConfig<OrchardFixedBases>,
     /// ECC configuration on [`Self::elgamal_advices`] for condition 11.
@@ -402,7 +402,7 @@ pub struct Circuit {
     // vote_authority_note_old = Poseidon(van_comm_core, van_comm_rand).
     //
     // Condition 3 (Diversified Address Integrity): vpk_pk_d = [ivk_v] * vpk_g_d
-    // where ivk_v = CommitIvk(ExtractP([vsk]*SpendAuthG), vsk.nk, rivk_v).
+    // where ivk_v = CommitIvk(ExtractP(vsk_ak), vsk.nk, rivk_v).
     // Full affine points are needed for condition 3's ECC operations;
     // x-coordinates are extracted in-circuit for Poseidon hashing (conditions 2, 7).
     /// Voting public key — diversified base point (from DiversifyHash(d)).
@@ -428,10 +428,13 @@ pub struct Circuit {
 
     // Condition 3 (Diversified Address Integrity): prover controls the VAN address.
     // vpk_pk_d = [ivk_v] * vpk_g_d
-    //   where ivk_v = CommitIvk_rivk_v(ExtractP([vsk]*SpendAuthG), vsk.nk)
-    /// Voting spending key (scalar for ECC multiplication).
-    /// Used in condition 3 for `[vsk] * SpendAuthG`.
-    pub(super) vsk: Value<pallas::Scalar>,
+    //   where ivk_v = CommitIvk_rivk_v(ExtractP(vsk_ak), vsk.nk)
+    /// Voting spend validating key `vsk.ak` (a non-identity Pallas point).
+    /// Used in condition 3 for CommitIvk and in condition 4 for `r_vpk`.
+    /// The spending scalar never enters the circuit: as in the Orchard action
+    /// circuit and ZKP 1, spend authority is the vote signature under `r_vpk`,
+    /// so a key held as threshold shares (e.g. FROST) can vote.
+    pub(super) vsk_ak: Value<pallas::Affine>,
     /// CommitIvk randomness for the ivk_v derivation (condition 3).
     /// Used as the blinding scalar in `CommitIvk(ak, nk, rivk_v)`.
     pub(super) rivk_v: Value<pallas::Scalar>,
@@ -506,7 +509,7 @@ impl Circuit {
     /// - Condition 2 binds `vote_authority_note_old` to the Poseidon hash
     ///   of its components (using x-coordinates extracted from vpk_g_d, vpk_pk_d).
     /// - Condition 3 proves diversified address integrity via CommitIvk chain:
-    ///   `[vsk] * SpendAuthG → ak → CommitIvk(ak, nk, rivk_v) → ivk_v → [ivk_v] * vpk_g_d = vpk_pk_d`.
+    ///   `vsk_ak → ExtractP → CommitIvk(ak, nk, rivk_v) → ivk_v → [ivk_v] * vpk_g_d = vpk_pk_d`.
     /// - Condition 5 reuses `vote_authority_note_old` and `voting_round_id`.
     /// - Condition 6 derives `proposal_authority_new` from
     ///   `proposal_authority_old`.
@@ -522,7 +525,7 @@ impl Circuit {
         proposal_authority_old: Value<pallas::Base>,
         van_comm_rand: Value<pallas::Base>,
         vote_authority_note_old: Value<pallas::Base>,
-        vsk: Value<pallas::Scalar>,
+        vsk_ak: Value<pallas::Affine>,
         rivk_v: Value<pallas::Scalar>,
         vsk_nk: Value<pallas::Base>,
         alpha_v: Value<pallas::Scalar>,
@@ -536,7 +539,7 @@ impl Circuit {
             proposal_authority_old,
             van_comm_rand,
             vote_authority_note_old,
-            vsk,
+            vsk_ak,
             rivk_v,
             alpha_v,
             vsk_nk,
@@ -907,18 +910,16 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ---------------------------------------------------------------
         // Condition 3: Diversified Address Integrity.
         //
-        // vpk_pk_d = [ivk_v] * vpk_g_d where ivk_v = CommitIvk(ExtractP([vsk]*SpendAuthG), vsk_nk, rivk_v).
+        // vpk_pk_d = [ivk_v] * vpk_g_d where ivk_v = CommitIvk(ExtractP(vsk_ak), vsk_nk, rivk_v).
+        //
+        // vsk_ak is witnessed as a non-identity point, exactly as ZKP 1 witnesses
+        // ak_P and as the Orchard action circuit does. An identity key would let
+        // any signature verify, so it is rejected here.
         // ---------------------------------------------------------------
-        let vsk_scalar = ScalarFixed::new(
+        let vsk_ak_point = NonIdentityPoint::new(
             ecc_chip.clone(),
-            layouter.namespace(|| "cond3 vsk"),
-            self.vsk,
-        )?;
-        let vsk_ak_point = spend_auth_g_mul(
-            ecc_chip.clone(),
-            layouter.namespace(|| "cond3 [vsk]G"),
-            "cond3: [vsk] SpendAuthG",
-            vsk_scalar,
+            layouter.namespace(|| "cond3 witness vsk_ak"),
+            self.vsk_ak,
         )?;
         let ak = vsk_ak_point.extract_p().inner().clone();
         let rivk_v_scalar = ScalarFixed::new(
@@ -954,7 +955,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             ecc_chip.clone(),
             layouter.namespace(|| "cond4 spend authority"),
             self.alpha_v,
-            &vsk_ak_point,
+            &vsk_ak_point.clone().into(),
             config.primary,
             R_VPK_X_PUBLIC_OFFSET,
             R_VPK_Y_PUBLIC_OFFSET,
@@ -1650,6 +1651,11 @@ mod tests {
         (c1_x, c2_x, c1_y, c2_y, randomness, share_blinds, hash)
     }
 
+    /// The spend validating key `[vsk] * SpendAuthG` that the circuit witnesses.
+    fn ak_of(vsk: pallas::Scalar) -> pallas::Affine {
+        (spend_auth_g_affine() * vsk).to_affine()
+    }
+
     /// Out-of-circuit voting key derivation for tests.
     ///
     /// Given a voting spending key (vsk), nullifier key (nk), and CommitIvk
@@ -1867,7 +1873,7 @@ mod tests {
                 Value::known(self.proposal_authority_old),
                 Value::known(self.van_comm_rand),
                 Value::known(vote_authority_note_old),
-                Value::known(self.vsk),
+                Value::known(ak_of(self.vsk)),
                 Value::known(self.rivk_v),
                 Value::known(self.vsk_nk),
                 Value::known(self.alpha_v),
@@ -1984,7 +1990,7 @@ mod tests {
             Value::known(proposal_authority_old),
             Value::known(van_comm_rand),
             Value::known(vote_authority_note_old),
-            Value::known(vsk),
+            Value::known(ak_of(vsk)),
             Value::known(rivk_v),
             Value::known(vsk_nk),
             Value::known(alpha_v),
@@ -2092,7 +2098,7 @@ mod tests {
             Value::known(proposal_authority_old),
             Value::known(van_comm_rand),
             Value::known(wrong_van),
-            Value::known(vsk),
+            Value::known(ak_of(vsk)),
             Value::known(rivk_v),
             Value::known(vsk_nk),
             Value::known(alpha_v),
@@ -2290,7 +2296,7 @@ mod tests {
         );
         let alpha_v = pallas::Scalar::random(&mut rng);
         let g = spend_auth_g_affine();
-        let r_vpk = (g * (vsk + alpha_v)).to_affine();
+        let r_vpk = (g * (wrong_vsk + alpha_v)).to_affine();
         let r_vpk_x = *r_vpk.coordinates().unwrap().x();
         let r_vpk_y = *r_vpk.coordinates().unwrap().y();
 
@@ -2303,7 +2309,7 @@ mod tests {
             Value::known(proposal_authority_old),
             Value::known(van_comm_rand),
             Value::known(vote_authority_note_old),
-            Value::known(wrong_vsk),
+            Value::known(ak_of(wrong_vsk)),
             Value::known(rivk_v),
             Value::known(vsk_nk),
             Value::known(alpha_v),
@@ -2338,6 +2344,76 @@ mod tests {
             prover.verify().is_err(),
             "condition 3 must reject wrong vsk"
         );
+    }
+
+    fn single_leaf_fixture_data(fixture: &VoteReuseFixture) -> (Circuit, Instance) {
+        let voting_round_id = pallas::Base::from(0xCAFE_u64);
+        let (auth_path, position, root) =
+            build_single_leaf_merkle_path(fixture.vote_authority_note_old(voting_round_id));
+        fixture.build_vote_data(voting_round_id, auth_path, position, root, 7)
+    }
+
+    fn with_r_vpk(mut instance: Instance, r_vpk: pallas::Affine) -> Instance {
+        instance.r_vpk_x = *r_vpk.coordinates().unwrap().x();
+        instance.r_vpk_y = *r_vpk.coordinates().unwrap().y();
+        instance
+    }
+
+    /// A signer that witnesses its own `ak` (and so can sign under the
+    /// resulting `r_vpk`) cannot spend a VAN whose address belongs to another
+    /// key. Every other condition holds; only condition 3's CommitIvk chain
+    /// rejects it, which is what ties the vote signer to the VAN.
+    #[test]
+    fn condition_3_rejects_a_signer_key_not_owning_the_van() {
+        let fixture = VoteReuseFixture::new();
+        let (mut circuit, instance) = single_leaf_fixture_data(&fixture);
+        let honest = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
+        assert_eq!(honest.verify(), Ok(()));
+
+        let attacker_vsk = pallas::Scalar::random(&mut OsRng);
+        circuit.vsk_ak = Value::known(ak_of(attacker_vsk));
+        let instance = with_r_vpk(
+            instance,
+            (spend_auth_g_affine() * (attacker_vsk + fixture.alpha_v)).to_affine(),
+        );
+
+        let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    /// The identity cannot be witnessed as `ak`: every signature would verify
+    /// under it, so synthesis refuses it, as for ZKP 1's `ak_P`.
+    #[test]
+    fn condition_3_rejects_identity_ak() {
+        let fixture = VoteReuseFixture::new();
+        let (mut circuit, instance) = single_leaf_fixture_data(&fixture);
+        circuit.vsk_ak =
+            Value::known(<pallas::Point as crate::group::Group>::identity().to_affine());
+
+        let rejected = match MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]) {
+            Err(_) => true,
+            Ok(prover) => prover.verify().is_err(),
+        };
+        assert!(rejected);
+    }
+
+    /// `-ak` has the same x-coordinate, so the same ivk and VAN address, and
+    /// the relation accepts it with `r_vpk = -ak + [alpha_v]G`. This matches
+    /// the Orchard action circuit and is harmless: a signature under that
+    /// `r_vpk` needs `-ask`, which only the key's holder can produce.
+    #[test]
+    fn condition_3_accepts_negated_ak_which_still_needs_the_key_to_sign() {
+        let fixture = VoteReuseFixture::new();
+        let (mut circuit, instance) = single_leaf_fixture_data(&fixture);
+        let negated_ak = (-pallas::Point::from(ak_of(fixture.vsk))).to_affine();
+        circuit.vsk_ak = Value::known(negated_ak);
+        let instance = with_r_vpk(
+            instance,
+            (pallas::Point::from(negated_ak) + spend_auth_g_affine() * fixture.alpha_v).to_affine(),
+        );
+
+        let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
+        assert_eq!(prover.verify(), Ok(()));
     }
 
     /// Using a vpk_pk_d that does not equal [ivk_v]*vpk_g_d should fail
@@ -2406,7 +2482,7 @@ mod tests {
             Value::known(proposal_authority_old),
             Value::known(van_comm_rand),
             Value::known(vote_authority_note_old),
-            Value::known(vsk),
+            Value::known(ak_of(vsk)),
             Value::known(rivk_v),
             Value::known(vsk_nk),
             Value::known(alpha_v),
@@ -2569,7 +2645,7 @@ mod tests {
             Value::known(proposal_authority_old),
             Value::known(van_comm_rand),
             Value::known(vote_authority_note_old),
-            Value::known(vsk),
+            Value::known(ak_of(vsk)),
             Value::known(rivk_v),
             Value::known(wrong_vsk_nk),
             Value::known(alpha_v),
@@ -2939,7 +3015,7 @@ mod tests {
             Value::known(proposal_authority_old),
             Value::known(van_comm_rand),
             Value::known(vote_authority_note_old),
-            Value::known(vsk),
+            Value::known(ak_of(vsk)),
             Value::known(rivk_v),
             Value::known(vsk_nk),
             Value::known(alpha_v),
@@ -3075,7 +3151,7 @@ mod tests {
             Value::known(proposal_authority_old),
             Value::known(van_comm_rand),
             Value::known(vote_authority_note_old),
-            Value::known(vsk),
+            Value::known(ak_of(vsk)),
             Value::known(rivk_v),
             Value::known(vsk_nk),
             Value::known(alpha_v),
@@ -3212,7 +3288,7 @@ mod tests {
             Value::known(proposal_authority_old),
             Value::known(van_comm_rand),
             Value::known(vote_authority_note_old),
-            Value::known(vsk),
+            Value::known(ak_of(vsk)),
             Value::known(rivk_v),
             Value::known(vsk_nk),
             Value::known(alpha_v),

@@ -23,8 +23,9 @@ mod gadgets;
 mod prove;
 
 pub use builder::{
-    build_vote_proof_from_delegation, derive_vote_authority_transition, EncryptedShareOutput,
-    VoteAuthorityTransition, VoteProofBundle,
+    build_vote_proof_from_delegation, build_vote_proof_from_fvk, derive_vote_authority_transition,
+    derive_vote_authority_transition_from_fvk, EncryptedShareOutput, VoteAuthorityTransition,
+    VotePrfKey, VoteProofBundle,
 };
 pub use circuit::{Circuit, Instance, K};
 pub use prove::{
